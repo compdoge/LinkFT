@@ -1,15 +1,15 @@
 {
-    "ModuleId": "2a8c8080-2a76-46af-bf76-1da7c0127ef8",
-    "LastUpdated": "2025-09-03T19:31:20.499054",
-    "Version": "1.0.8",
+    "ModuleId": "8dca1f59-17df-4a27-9e12-46f8fdc332c5",
+    "LastUpdated": "2026-07-30T22:56:24.9917643+02:00",
+    "Version": "1.0.0",
     "Downloads": 0,
     "Ratings": 0,
     "Rating": 0,
-    "AuthorName": "Ykeara",
-    "ModuleName": "SteamLink VRCFT Module",
-    "ModuleDescription": "VRCFT eye and face tracking module for steamlink on Meta Quest devices.",
-    "UsageInstructions": "Run on VRCFT Launch (uninstall if you need another module)",
-    "DownloadUrl": "https://github.com/ykeara/LinkFT/releases/latest/download/LinkFTModule.zip",
+    "AuthorName": "Ykeara; Galaxy XR local adaptation by komp dog",
+    "ModuleName": "Dedicated Galaxy XR SteamLink Module",
+    "ModuleDescription": "VRCFT eye and face tracking module for the dedicated-gxr-facebridge-requiresmodule Steam Link APK.",
+    "UsageInstructions": "Use only with the matching dedicated Galaxy XR face-bridge APK. Steam Link OSC output must use port 9015.",
+    "DownloadUrl": "",
     "ModulePageUrl": "https://github.com/ykeara/LinkFT",
     "DllFileName": "SteamLinkVRCFTModule.dll"
 }

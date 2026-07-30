@@ -88,8 +88,11 @@ namespace SteamLinkVRCFTModule
             { NoseSneerLeft,0.0f},
             {NoseSneerRight ,0.0f},
 
-            {TongueCurlUp ,0.0f},
             {TongueOut ,0.0f},
+            {TongueLeft ,0.0f},
+            {TongueRight ,0.0f},
+            {TongueUp ,0.0f},
+            {TongueDown ,0.0f},
 
             };
 
@@ -159,15 +162,15 @@ namespace SteamLinkVRCFTModule
                 {"/sl/xrfb/facew/NoseWrinklerL", new List<UnifiedExpressions>{NoseSneerLeft} },
                 {"/sl/xrfb/facew/NoseWrinklerR", new List<UnifiedExpressions>{NoseSneerRight} },
 
-                //Tongue Tracking Params
-                //Some params sent but not part of UE or used? need to look into
-                //{"/sl/xrfb/facew/TongueTipInterdental",  new List<UnifiedExpressions>{} },
-                //{"/sl/xrfb/facew/FrontDorsalPalate",  new List<UnifiedExpressions>{} },
-                //{"/sl/xrfb/facew/MidDorsalPalate",  new List<UnifiedExpressions>{} },
-                //{"/sl/xrfb/facew/BackDorsalVelar",  new List<UnifiedExpressions>{} },
-                //{"/sl/xrfb/facew/TongueRetreat",  new List<UnifiedExpressions>{} },
-                //{"/sl/xrfb/facew/TongueTipAlveolar", new List<UnifiedExpressions>{TongueCurlUp} },
-                {"/sl/xrfb/facew/TongueOut", new List<UnifiedExpressions>{TongueOut} },
+                // Galaxy XR's dedicated face bridge copies Android tongue
+                // parameters 63..67 directly into Steam Link's FB2 slots.
+                {"/sl/xrfb/facew/TongueTipInterdental", new List<UnifiedExpressions>{TongueOut} }, // 63
+                {"/sl/xrfb/facew/TongueTipAlveolar", new List<UnifiedExpressions>{TongueLeft} }, // 64
+                {"/sl/xrfb/facew/FrontDorsalPalate", new List<UnifiedExpressions>{TongueRight} }, // 65
+                {"/sl/xrfb/facew/MidDorsalPalate", new List<UnifiedExpressions>{TongueUp} }, // 66
+                {"/sl/xrfb/facew/BackDorsalVelar", new List<UnifiedExpressions>{TongueDown} }, // 67
+                // Slots 68 (TongueRetreat) and 69 (TongueOut) are unused by
+                // the dedicated Galaxy XR transport override.
             };
 
 

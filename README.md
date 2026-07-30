@@ -2,10 +2,19 @@
 
 The Implementation is **EXPERIMENTAL** and may change without notice causing app to fail.
 
+## Dedicated Galaxy XR fork
+
+This checkout is paired with the
+`dedicated-gxr-facebridge-requiresmodule` Galaxy XR Steam Link APK. It maps
+the five transported Galaxy XR tongue values to the VRCFT unified
+expressions `TongueOut`, `TongueLeft`, `TongueRight`, `TongueUp`, and
+`TongueDown`.
+
 ## Install
 
-- Download Latest Release from [Releases](https://github.com/ykeara/LinkFT/releases/latest)
-- In VRCFT go to modules and install from zip
+- Build or use the dedicated module ZIP packaged beside this source tree.
+- In VRCFT, go to Modules and install it from the ZIP.
+- Do not install the stock LinkFT release over this dedicated module.
 
 
 ## Setup

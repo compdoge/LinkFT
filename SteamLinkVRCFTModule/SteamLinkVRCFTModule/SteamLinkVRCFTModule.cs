@@ -16,7 +16,7 @@ namespace SteamLinkVRCFTModule
 
         public override (bool eyeSuccess, bool expressionSuccess) Initialize(bool eyeAvailable, bool expressionAvailable)
         {
-            ModuleInformation.Name = "SteamLink Module";
+            ModuleInformation.Name = "Dedicated Galaxy XR SteamLink Module";
 
             var stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("SteamLinkVRCFTModule.Assets.steamlink.png");
             ModuleInformation.StaticImages = stream != null ? new List<Stream> { stream } : ModuleInformation.StaticImages;
