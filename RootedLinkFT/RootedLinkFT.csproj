@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <Version>0.1.0</Version>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>RootedLinkFT</AssemblyName>
+    <RootNamespace>RootedLinkFT</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="Assets\galaxy-xr.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\galaxy-xr.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\VRCFaceTracking\VRCFaceTracking.Core\VRCFaceTracking.Core.csproj" />
+  </ItemGroup>
+
+  <Target Name="CopyModuleMetadata" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\res\module.json" DestinationFolder="$(TargetDir)" />
+  </Target>
+
+  <Target Name="InstallModule" AfterTargets="CopyModuleMetadata" Condition="'$(InstallVRCFTModule)' == 'true'">
+    <PropertyGroup>
+      <ModuleInstallDir>$(APPDATA)\VRCFaceTracking\CustomLibs\b7c2f9e4-3a61-4d58-9c0e-7f2a1d6b4e90</ModuleInstallDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(ModuleInstallDir)" />
+    <Copy SourceFiles="$(TargetPath);$(TargetDir)module.json" DestinationFolder="$(ModuleInstallDir)" />
+  </Target>
+
+</Project>
