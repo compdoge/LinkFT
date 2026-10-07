@@ -11,7 +11,7 @@
 //   offset  field     type   notes
 //   0       magic     u32    0x58525847 ('GXRX')
 //   4       version   u8     1
-//   5       type      u8     1 = gaze, 2 = pupil, 3 = face(optional), 4 = tongueB(optional)
+//   5       type      u8     1 = gaze, 2 = pupil, 3 = face(optional), 4 = tongue
 //   6       flags     u16    bit0 = valid / calibrated
 //   8       seq       u32    per-type counter
 //   12      t_us      u64    sender CLOCK_MONOTONIC, microseconds
@@ -36,7 +36,7 @@ namespace RootedLinkFT
         Gaze = 1,
         Pupil = 2,
         Face = 3,
-        TongueB = 4,
+        Tongue = 4,
     }
 
     public sealed class GxrxGaze
@@ -60,6 +60,14 @@ namespace RootedLinkFT
         public GxrxPupilDetection[] Detections = Array.Empty<GxrxPupilDetection>();
     }
 
+    /// <summary>11-D predicted_local_tongue_expression (u2[63..73]).</summary>
+    public sealed class GxrxTongue
+    {
+        public long TUs;
+        public const int Count = 11;
+        public readonly float[] Values = new float[Count];
+    }
+
     /// <summary>
     /// Background UDP listener for GXRX v1 packets. Keeps the latest gaze and
     /// pupil frames; the module polls them on its own update tick.
@@ -71,6 +79,7 @@ namespace RootedLinkFT
         public const int HeaderSize = 22;
 
         private const int GazePayloadSize = 15 * 4;
+        private const int TonguePayloadSize = GxrxTongue.Count * 4;
         private const int MaxDatagram = 4096;
 
         private readonly ILogger _logger;
@@ -81,15 +90,18 @@ namespace RootedLinkFT
         private readonly object _gate = new();
         private GxrxGaze? _gaze;
         private GxrxPupil? _pupil;
+        private GxrxTongue? _tongue;
 
         public int Port { get; }
         public long GazePackets { get; private set; }
         public long PupilPackets { get; private set; }
+        public long TonguePackets { get; private set; }
 
         // Local (PC) receive times. The sender's t_us is CLOCK_MONOTONIC on the
         // headset and is not comparable to PC time, so freshness is measured here.
         public long GazeLastLocalMs { get; private set; }
         public long PupilLastLocalMs { get; private set; }
+        public long TongueLastLocalMs { get; private set; }
 
         public GxrxReceiver(ILogger logger, int port)
         {
@@ -183,8 +195,18 @@ namespace RootedLinkFT
                     PupilPackets++;
                     break;
 
+                case GxrxType.Tongue:
+                    if (payloadLen < TonguePayloadSize) return;
+                    var tg = new GxrxTongue { TUs = tUs };
+                    for (int i = 0; i < GxrxTongue.Count; i++)
+                        tg.Values[i] = BitConverter.ToSingle(d, HeaderSize + i * 4);
+                    lock (_gate) { _tongue = tg; }
+                    TongueLastLocalMs = Environment.TickCount64;
+                    TonguePackets++;
+                    break;
+
                 default:
-                    // Face / TongueB are reserved; ignored for now.
+                    // Face is reserved; ignored for now.
                     break;
             }
         }
@@ -199,6 +221,12 @@ namespace RootedLinkFT
         public GxrxPupil? LatestPupil()
         {
             lock (_gate) return _pupil;
+        }
+
+        /// <summary>Latest tongue frame, or null if none received.</summary>
+        public GxrxTongue? LatestTongue()
+        {
+            lock (_gate) return _tongue;
         }
 
         public void Dispose()

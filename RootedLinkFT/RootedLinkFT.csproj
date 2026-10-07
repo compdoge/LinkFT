@@ -17,6 +17,7 @@
     <EmbeddedResource Include="Assets\galaxy-xr.png">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </EmbeddedResource>
+    <EmbeddedResource Include="tongue-map.json" />
   </ItemGroup>
 
   <ItemGroup>

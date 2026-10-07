@@ -8,7 +8,7 @@
     "AuthorName": "komp dog",
     "ModuleName": "Galaxy XR RootedLinkFT Module",
     "ModuleDescription": "Adds root-only Galaxy XR parameters to the Steam Link face/eye stream: true per-eye gaze and pupil dilation/diameter (GXRX uplink). Superset of the dedicated SteamLink module.",
-    "UsageInstructions": "Use with the dedicated Galaxy XR FaceBridge Steam Link APK. Steam Link OSC output must use port 9015. Run gxr-relayd (root) and eyecap (shell) on the headset; GXRX must reach this PC on UDP 9016.",
+    "UsageInstructions": "Use with the dedicated Galaxy XR FaceBridge Steam Link APK. Steam Link OSC output must use port 9015. Run gxr-relayd (root) and eyecap (shell) on the headset; GXRX must reach this PC on UDP 9026.",
     "DownloadUrl": "https://github.com/compdoge/LinkFT",
     "ModulePageUrl": "https://github.com/compdoge/LinkFT",
     "DllFileName": "RootedLinkFT.dll"
