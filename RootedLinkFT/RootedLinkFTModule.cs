@@ -16,7 +16,9 @@
 //
 // Pair this with:
 //   - the dedicated Galaxy XR FaceBridge Steam Link APK (as before), and
-//   - gxr-relayd (root) + eyecap (shell) on the headset, sending GXRX v1.
+//   - gxr_relayd (root) on the headset, sending GXRX v1. The true per-eye gaze
+//     comes from a read-only uprobe on the host DNN tensor, so there is no
+//     vendor-client process and no mount-namespace dance.
 
 using System.Reflection;
 using System.Text.Json;
@@ -38,37 +40,24 @@ namespace RootedLinkFT
         // Treat a frame as live if it arrived within this window.
         private const long FRESH_MS = 500;
 
-        // Ellipse radius (0..1 of the camera image) -> millimetres. Provisional:
-        // the true scale needs a calibration pass (see LIVE-PC-LINK-PLAN.md §6).
-        // Diameter = 2 * max(axisA, axisB); VRCFT normalizes PupilDilation itself.
-        private const float PupilMmScale = 32.0f;
+        // Ellipse radius (0..1 of the camera image) -> millimetres. Provisional
+        // scale; default 24 is the tuned value (see LIVE-PC-LINK-PLAN.md §6).
+        private float _pupilMmScale = 24.0f;
 
-        // Convergence. The client per-eye *directions* are essentially parallel
-        // (constant yaw offset ~0.03 rad even when crossing hard), but the eye
-        // *positions* carry the real vergence: IPD drops ~25% when focusing near.
-        //
-        // Everything is normalized by the wearer's own baseline IPD, so a
-        // different user / headset fit needs no retuning:
-        //   neutral = running max IPD (auto), or neutralIpdMm from config
-        //   rel     = (neutral - ipd) / neutral        (fractional IPD loss)
-        //   verg    = clamp(rel / fullScaleFrac, 0, 1) * maxVergenceRad
-        // A larger-IPD wearer has a larger absolute IPD drop for the same
-        // convergence angle, which this fraction cancels out.
-        //
-        // Optional overrides live in `rootedlinkft.json` beside this DLL:
-        //   { "neutralIpdMm": 64.5, "fullScaleFrac": 0.24,
-        //     "maxVergenceRad": 0.33, "deadzoneMm": 0.5 }
-        private const float IpdMin = 0.02f;          // plausibility window (m)
-        private const float IpdMax = 0.12f;
-        private const bool VergenceDebug = false;    // 1 Hz ipd/neutral/verg log
-        private float _ipdNeutral = 0.0645f;         // baseline (auto or fixed)
-        private bool _neutralInit;                   // first plausible frame seen
-        private bool _neutralAuto = true;
-        private float _neutralFixed = 0.0645f;
-        private float _fullScaleFrac = 0.24f;        // fractional IPD loss = full cross
-        private float _maxVergence = 0.33f;          // rad per eye at full cross
-        private float _deadzone = 0.0005f;           // m
-        private long _lastVergLogMs;
+        // VRCFT derives v2/PupilDilation by normalizing between the min/max it
+        // observes, so uniform mm scaling cancels out. To shrink the visible
+        // dilation amplitude we widen that min/max window by 1/gain. 0.75 => 25%
+        // smaller swings. (v2/PupilDiameter* are absolute mm, so _pupilMmScale
+        // directly sets their magnitude.)
+        private float _pupilDilationGain = 0.75f;
+        private float _pupilMinMm = float.MaxValue;
+        private float _pupilMaxMm = float.MinValue;
+
+        // Gaze comes straight from the host DNN's true per-eye directions (GXRX
+        // type 5). No synthesis: each eye's x/y is atan2 of its own direction
+        // vector, so convergence is real and needs no per-user calibration.
+        private const bool GazeDebug = true;         // 1 Hz gaze-source log
+        private long _lastGazeLogMs;
 
         // Which pupil detections belong to which eye. UNKNOWN today (the four
         // detections all react to gaze), so both eyes average all detections and
@@ -87,7 +76,10 @@ namespace RootedLinkFT
 
         private bool _hadGxrxGaze;
         private bool _hadGxrxPupil;
+        private bool _hadFace;
         private bool _hadTongue;
+        private readonly float[] _faceClosed = new float[2];
+        private bool _faceEyelidsValid;
 
         public override (bool SupportsEye, bool SupportsExpression) Supported => (true, true);
 
@@ -157,72 +149,58 @@ namespace RootedLinkFT
         {
             long now = Environment.TickCount64;
 
-            // ---- gaze: prefer the true per-eye GXRX stream ----
-            var gaze = Gxrx?.LatestGaze();
-            bool gazeFresh = gaze != null && (now - Gxrx!.GazeLastLocalMs) <= FRESH_MS;
+            // ---- gaze: true per-eye directions from the host DNN (GXRX type 5) ----
+            // No synthesis: each eye's yaw/pitch is atan2 of its own raw
+            // direction vector, so convergence is whatever the DNN actually saw.
+            var ed = Gxrx?.LatestEyeDir();
+            bool edFresh = ed != null && (now - Gxrx!.EyeDirLastLocalMs) <= FRESH_MS;
+            bool hasL = edFresh && ed!.HasLeft;
+            bool hasR = edFresh && ed.HasRight;
 
-            if (gazeFresh)
+            if ((hasL || hasR) && !_hadGxrxGaze)
             {
-                if (!_hadGxrxGaze)
-                {
-                    _hadGxrxGaze = true;
-                    Logger.LogInformation("[RootedLinkFT] true per-eye gaze streaming (GXRX)");
-                }
-                // Common (conjugate) gaze from the two directions.
-                float yawL = DirYaw(gaze!.LDir[0], gaze.LDir[2]);
-                float yawR = DirYaw(gaze.RDir[0], gaze.RDir[2]);
-                float commonX = 0.5f * (yawL + yawR);
+                _hadGxrxGaze = true;
+                Logger.LogInformation("[RootedLinkFT] true per-eye gaze streaming (GXRX eyedir)");
+            }
 
-                // Per-wearer baseline: seed from the first plausible frame, then
-                // track the running max (far). Never decay -- the eye-position
-                // separation sits at the working distance for long stretches and
-                // a decaying baseline would erase the vergence signal.
-                float ipd = gaze.RPos[0] - gaze.LPos[0];
-                if (_neutralAuto)
-                {
-                    if (ipd > IpdMin && ipd < IpdMax)
-                    {
-                        if (!_neutralInit) { _ipdNeutral = ipd; _neutralInit = true; }
-                        else if (ipd > _ipdNeutral) _ipdNeutral = ipd;
-                    }
-                }
-                else
-                {
-                    _ipdNeutral = _neutralFixed;
-                }
+            // Combined Steam Link gaze, used per-eye as the fallback when the
+            // host uprobe has no fresh frame for that eye.
+            float fAngleX = GazeAngleX(OSCHandler.eyeTrackData[0], OSCHandler.eyeTrackData[2]);
+            float fAngleY = GazeAngleY(OSCHandler.eyeTrackData[1], OSCHandler.eyeTrackData[2]);
 
-                // Fractional IPD loss -> per-eye inward rotation. Normalized by
-                // the baseline, so the same relative convergence gives the same
-                // rotation regardless of the wearer's IPD.
-                float rel = (_ipdNeutral - ipd - _deadzone) / MathF.Max(_ipdNeutral, 0.03f);
-                if (rel < 0f) rel = 0f;
-                float verg = Math.Clamp(rel / _fullScaleFrac, 0f, 1f) * _maxVergence;
-
-                float leftX = commonX + verg;   // left eye turns in (toward +x)
-                float rightX = commonX - verg;  // right eye turns in (toward -x)
-
-                if (VergenceDebug && now - _lastVergLogMs > 1000)
-                {
-                    _lastVergLogMs = now;
-                    Logger.LogInformation(
-                        "[RootedLinkFT] ipd={Ipd:F1}mm neutral={Neutral:F1}mm common={C:F3} verg={V:F3} -> EyeLeftX={L:F3} EyeRightX={R:F3}",
-                        ipd * 1000f, _ipdNeutral * 1000f, commonX, verg, leftX, rightX);
-                }
-
-                UnifiedTracking.Data.Eye.Left.Gaze.x = leftX;
-                UnifiedTracking.Data.Eye.Right.Gaze.x = rightX;
-                UnifiedTracking.Data.Eye.Left.Gaze.y = DirPitch(gaze.LDir[1], gaze.LDir[2]);
-                UnifiedTracking.Data.Eye.Right.Gaze.y = DirPitch(gaze.RDir[1], gaze.RDir[2]);
+            if (hasL)
+            {
+                UnifiedTracking.Data.Eye.Left.Gaze.x = DirYaw(ed!.LDir[0], ed.LDir[2]);
+                UnifiedTracking.Data.Eye.Left.Gaze.y = DirPitch(ed.LDir[1], ed.LDir[2]);
             }
             else
             {
-                // Fall back to the combined Steam Link gaze (as before).
-                float fAngleX = GazeAngleX(OSCHandler.eyeTrackData[0], OSCHandler.eyeTrackData[2]);
-                float fAngleY = GazeAngleY(OSCHandler.eyeTrackData[1], OSCHandler.eyeTrackData[2]);
                 UnifiedTracking.Data.Eye.Left.Gaze.x = fAngleX;
                 UnifiedTracking.Data.Eye.Left.Gaze.y = fAngleY;
+            }
+
+            if (hasR)
+            {
+                UnifiedTracking.Data.Eye.Right.Gaze.x = DirYaw(ed!.RDir[0], ed.RDir[2]);
+                UnifiedTracking.Data.Eye.Right.Gaze.y = DirPitch(ed.RDir[1], ed.RDir[2]);
+            }
+            else
+            {
                 UnifiedTracking.Data.Eye.Right.Gaze.x = fAngleX;
                 UnifiedTracking.Data.Eye.Right.Gaze.y = fAngleY;
+            }
+
+            bool gazeValid = hasL || hasR;
+
+            if (GazeDebug && now - _lastGazeLogMs > 1000)
+            {
+                _lastGazeLogMs = now;
+                Logger.LogInformation(
+                    "[RootedLinkFT] gaze src={Src} L=({Lx:F3},{Ly:F3}) R=({Rx:F3},{Ry:F3}) osc=({O0:F3},{O1:F3},{O2:F3})",
+                    gazeValid ? "GXRX" : "OSC",
+                    UnifiedTracking.Data.Eye.Left.Gaze.x, UnifiedTracking.Data.Eye.Left.Gaze.y,
+                    UnifiedTracking.Data.Eye.Right.Gaze.x, UnifiedTracking.Data.Eye.Right.Gaze.y,
+                    OSCHandler.eyeTrackData[0], OSCHandler.eyeTrackData[1], OSCHandler.eyeTrackData[2]);
             }
 
             // ---- pupil diameter / dilation from the GXRX ellipse ----
@@ -240,16 +218,34 @@ namespace RootedLinkFT
                 float right = AverageDiameterMm(pupil.Detections, RightPupilIndices);
                 UnifiedTracking.Data.Eye.Left.PupilDiameter_MM = left;
                 UnifiedTracking.Data.Eye.Right.PupilDiameter_MM = right;
+
+                // Compress the normalized PupilDilation by widening VRCFT's
+                // observed min/max window (it only ever widens, so our wider
+                // window sticks). Track our own range so the window follows this
+                // wearer's lighting/adaptation rather than using fixed numbers.
+                float obs = 0.5f * (left + right);
+                if (obs > 0f)
+                {
+                    if (obs < _pupilMinMm) _pupilMinMm = obs;
+                    if (obs > _pupilMaxMm) _pupilMaxMm = obs;
+                    float center = 0.5f * (_pupilMinMm + _pupilMaxMm);
+                    float half = 0.5f * MathF.Max(_pupilMaxMm - _pupilMinMm, 0.05f);
+                    float wideHalf = half / MathF.Max(_pupilDilationGain, 0.05f);
+                    UnifiedTracking.Data.Eye._minDilation = center - wideHalf;
+                    UnifiedTracking.Data.Eye._maxDilation = center + wideHalf;
+                }
             }
 
-            // ---- lids / openness from the Steam Link face stream (unchanged) ----
-            float fLeftOpenness = CalculateEyeOpenness(OSCHandler.eyelids[0], OSCHandler.ueData[EyeSquintLeft]);
-            float fRightOpenness = CalculateEyeOpenness(OSCHandler.eyelids[1], OSCHandler.ueData[EyeSquintRight]);
-            UnifiedTracking.Data.Eye.Left.Openness = fLeftOpenness;
-            UnifiedTracking.Data.Eye.Right.Openness = fRightOpenness;
+            // ---- lids / openness: prefer the GXRX face eyelids, else OSC ----
+            float closedL = _faceEyelidsValid ? _faceClosed[0] : OSCHandler.eyelids[0];
+            float closedR = _faceEyelidsValid ? _faceClosed[1] : OSCHandler.eyelids[1];
+            float squintL = UnifiedTracking.Data.Shapes[(int)EyeSquintLeft].Weight;
+            float squintR = UnifiedTracking.Data.Shapes[(int)EyeSquintRight].Weight;
+            UnifiedTracking.Data.Eye.Left.Openness = CalculateEyeOpenness(closedL, squintL);
+            UnifiedTracking.Data.Eye.Right.Openness = CalculateEyeOpenness(closedR, squintR);
         }
 
-        private static float AverageDiameterMm(GxrxPupilDetection[] detections, int[] indices)
+        private float AverageDiameterMm(GxrxPupilDetection[] detections, int[] indices)
         {
             if (detections.Length == 0 || indices.Length == 0) return 0f;
             float sum = 0f;
@@ -261,14 +257,36 @@ namespace RootedLinkFT
                 sum += 2.0f * MathF.Max(d.A, d.B);
                 n++;
             }
-            return n == 0 ? 0f : (sum / n) * PupilMmScale;
+            return n == 0 ? 0f : (sum / n) * _pupilMmScale;
         }
 
         private void UpdateFaceTracking()
         {
-            foreach (KeyValuePair<UnifiedExpressions, float> entry in OSCHandler.ueData)
+            // Prefer the on-headset 68-blendshape stream (works with any streamer
+            // or none); fall back to the Steam Link OSC face weights.
+            var face = Gxrx?.LatestFace();
+            bool faceFresh = face != null &&
+                (Environment.TickCount64 - Gxrx!.FaceLastLocalMs) <= FRESH_MS;
+
+            if (faceFresh)
             {
-                UnifiedTracking.Data.Shapes[(int)entry.Key].Weight = entry.Value;
+                if (!_hadFace)
+                {
+                    _hadFace = true;
+                    Logger.LogInformation("[RootedLinkFT] 68-blendshape face streaming (GXRX)");
+                }
+                ApplyFace68(face!.Values);
+                _faceClosed[0] = face.Values[12];  // Eyes_Closed_L
+                _faceClosed[1] = face.Values[13];  // Eyes_Closed_R
+                _faceEyelidsValid = true;
+            }
+            else
+            {
+                _faceEyelidsValid = false;
+                foreach (KeyValuePair<UnifiedExpressions, float> entry in OSCHandler.ueData)
+                {
+                    UnifiedTracking.Data.Shapes[(int)entry.Key].Weight = entry.Value;
+                }
             }
 
             // Lip suck compensation (kept from the dedicated module).
@@ -279,6 +297,51 @@ namespace RootedLinkFT
                 Math.Min(1.0f - (float)Math.Pow(UnifiedTracking.Data.Shapes[(int)MouthUpperRight].Weight, 1f / 6f),
                          UnifiedTracking.Data.Shapes[(int)LipSuckUpperRight].Weight);
         }
+
+        /// <summary>Host 68 blendshapes (Android XR enum order) -> Unified Expressions.</summary>
+        private static void ApplyFace68(float[] f)
+        {
+            var shapes = UnifiedTracking.Data.Shapes;
+            foreach (var (face, ue) in Face68Map)
+                shapes[ue].Weight = f[face];
+        }
+
+        // (face index, Unified Expression). Mirrors OSCHandler's OSC name map.
+        private static readonly (int Face, int Ue)[] Face68Map =
+        {
+            (0, (int)BrowPinchLeft), (0, (int)BrowLowererLeft),
+            (1, (int)BrowPinchRight), (1, (int)BrowLowererRight),
+            (2, (int)CheekPuffLeft), (3, (int)CheekPuffRight),
+            (4, (int)CheekSquintLeft), (5, (int)CheekSquintRight),
+            (6, (int)CheekSuckLeft), (7, (int)CheekSuckRight),
+            (8, (int)MouthRaiserLower), (9, (int)MouthRaiserUpper),
+            (10, (int)MouthDimpleLeft), (11, (int)MouthDimpleRight),
+            (22, (int)BrowInnerUpLeft), (23, (int)BrowInnerUpRight),
+            (24, (int)JawOpen), (25, (int)JawLeft), (26, (int)JawRight), (27, (int)JawForward),
+            (28, (int)EyeSquintLeft), (29, (int)EyeSquintRight),
+            (30, (int)MouthFrownLeft), (31, (int)MouthFrownRight),
+            (32, (int)MouthCornerPullLeft), (32, (int)MouthCornerSlantLeft),
+            (33, (int)MouthCornerPullRight), (33, (int)MouthCornerSlantRight),
+            (34, (int)LipFunnelLowerLeft), (35, (int)LipFunnelUpperLeft),
+            (36, (int)LipFunnelLowerRight), (37, (int)LipFunnelUpperRight),
+            (38, (int)MouthPressLeft), (39, (int)MouthPressRight),
+            (40, (int)LipPuckerLowerLeft), (40, (int)LipPuckerUpperLeft),
+            (41, (int)LipPuckerLowerRight), (41, (int)LipPuckerUpperRight),
+            (42, (int)MouthStretchLeft), (43, (int)MouthStretchRight),
+            (44, (int)LipSuckLowerLeft), (45, (int)LipSuckUpperLeft),
+            (46, (int)LipSuckLowerRight), (47, (int)LipSuckUpperRight),
+            (48, (int)MouthTightenerLeft), (49, (int)MouthTightenerRight),
+            (50, (int)MouthClosed),
+            (51, (int)MouthLowerDownLeft), (52, (int)MouthLowerDownRight),
+            (53, (int)MouthLowerLeft), (53, (int)MouthUpperLeft),
+            (54, (int)MouthLowerRight), (54, (int)MouthUpperRight),
+            (55, (int)NoseSneerLeft), (56, (int)NoseSneerRight),
+            (57, (int)BrowOuterUpLeft), (58, (int)BrowOuterUpRight),
+            (59, (int)EyeWideLeft), (60, (int)EyeWideRight),
+            (61, (int)MouthUpperUpLeft), (62, (int)MouthUpperUpRight),
+            (63, (int)TongueOut), (64, (int)TongueLeft), (65, (int)TongueRight),
+            (66, (int)TongueUp), (67, (int)TongueDown),
+        };
 
         private static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
 
@@ -293,19 +356,12 @@ namespace RootedLinkFT
 
                 using var doc = JsonDocument.Parse(File.ReadAllBytes(cfg));
                 var r = doc.RootElement;
-                if (r.TryGetProperty("neutralIpdMm", out var n) && n.GetSingle() > 0f)
-                {
-                    _neutralAuto = false;
-                    _neutralFixed = n.GetSingle() / 1000f;
-                    _ipdNeutral = _neutralFixed;
-                }
-                if (r.TryGetProperty("fullScaleFrac", out var f)) _fullScaleFrac = f.GetSingle();
-                if (r.TryGetProperty("maxVergenceRad", out var m)) _maxVergence = m.GetSingle();
-                if (r.TryGetProperty("deadzoneMm", out var d)) _deadzone = d.GetSingle() / 1000f;
+                if (r.TryGetProperty("pupilMmScale", out var ps)) _pupilMmScale = ps.GetSingle();
+                if (r.TryGetProperty("pupilDilationGain", out var pg)) _pupilDilationGain = pg.GetSingle();
 
                 Logger.LogInformation(
-                    "[RootedLinkFT] config: auto={Auto} neutral={N:F1}mm fullScale={F} maxVerg={M}rad",
-                    _neutralAuto, _ipdNeutral * 1000f, _fullScaleFrac, _maxVergence);
+                    "[RootedLinkFT] config: pupilMmScale={S} pupilDilationGain={G}",
+                    _pupilMmScale, _pupilDilationGain);
             }
             catch (Exception e)
             {

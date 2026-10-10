@@ -1,28 +1,31 @@
 // GxrxProtocol.cs - receiver + decoder for the "GXRX" headset uplink.
 //
-// The Galaxy XR on-headset relay (gxr-relayd, root) and the gaze driver
-// (eyecap, shell) send small UDP datagrams to the PC on this port. This is the
-// live link that carries the parameters only the raw perception stack exposes:
-// the 2D pupil ellipse (-> PupilDilation / PupilDiameter*) and true per-eye
-// gaze.
+// The Galaxy XR on-headset relay (gxr_relayd, root) sends small UDP datagrams
+// to the PC on this port. This is the live link that carries the parameters only
+// the raw perception stack exposes: true per-eye gaze directions, the 2D pupil
+// ellipse (-> PupilDilation / PupilDiameter*) and the 11-D tongue. The true
+// per-eye gaze comes from a read-only uprobe on the host DNN tensor, so there is
+// no vendor-client ("eyecap") process and no mount-namespace dance.
 //
 // Wire format v1, all little-endian:
 //
 //   offset  field     type   notes
 //   0       magic     u32    0x58525847 ('GXRX')
 //   4       version   u8     1
-//   5       type      u8     1 = gaze, 2 = pupil, 3 = face(optional), 4 = tongue
+//   5       type      u8     2 = pupil, 3 = face(optional), 4 = tongue,
+//                            5 = eyedir
 //   6       flags     u16    bit0 = valid / calibrated
 //   8       seq       u32    per-type counter
 //   12      t_us      u64    sender CLOCK_MONOTONIC, microseconds
 //   20      len       u16    payload byte count
 //   22      payload   ...
 //
-//   type 1 gaze  : 15 * float32 = 60 bytes
-//                  Lpos[3], Ldir[3], Rpos[3], Rdir[3], binoPt[3]
 //   type 2 pupil : u8 nd, then nd * 6 * float32
 //                  per detection: x, y, a, b, conf, angle
 //                  (a/b are ellipse radii, normalized to the camera image)
+//   type 4 tongue: 11 * float32 (predicted_local_tongue_expression)
+//   type 5 eyedir: u8 mask (bit0 = L valid, bit1 = R valid), then
+//                  Ldir[3], Rdir[3] as raw float32 gaze directions.
 
 using System.Buffers.Binary;
 using System.Net;
@@ -33,20 +36,26 @@ namespace RootedLinkFT
 {
     public enum GxrxType : byte
     {
-        Gaze = 1,
         Pupil = 2,
         Face = 3,
         Tongue = 4,
+        EyeDir = 5,
     }
 
-    public sealed class GxrxGaze
+    /// <summary>
+    /// True per-eye gaze directions from the host DNN tensor (type 5). Raw
+    /// float32 vectors; the module converts them to yaw/pitch. Mask bit0 = left
+    /// valid, bit1 = right valid.
+    /// </summary>
+    public sealed class GxrxEyeDir
     {
         public long TUs;
-        public readonly float[] LPos = new float[3];
+        public byte Mask;
         public readonly float[] LDir = new float[3];
-        public readonly float[] RPos = new float[3];
         public readonly float[] RDir = new float[3];
-        public readonly float[] BinoPt = new float[3];
+
+        public bool HasLeft => (Mask & 1) != 0;
+        public bool HasRight => (Mask & 2) != 0;
     }
 
     public struct GxrxPupilDetection
@@ -68,6 +77,14 @@ namespace RootedLinkFT
         public readonly float[] Values = new float[Count];
     }
 
+    /// <summary>68 Android-XR face blendshapes (host 0x3589f8), enum order.</summary>
+    public sealed class GxrxFace
+    {
+        public long TUs;
+        public const int Count = 68;
+        public readonly float[] Values = new float[Count];
+    }
+
     /// <summary>
     /// Background UDP listener for GXRX v1 packets. Keeps the latest gaze and
     /// pupil frames; the module polls them on its own update tick.
@@ -78,7 +95,8 @@ namespace RootedLinkFT
         public const byte Version = 1;
         public const int HeaderSize = 22;
 
-        private const int GazePayloadSize = 15 * 4;
+        private const int EyeDirPayloadSize = 1 + 6 * 4;
+        private const int FacePayloadSize = GxrxFace.Count * 4;
         private const int TonguePayloadSize = GxrxTongue.Count * 4;
         private const int MaxDatagram = 4096;
 
@@ -88,19 +106,22 @@ namespace RootedLinkFT
         private volatile bool _loop = true;
 
         private readonly object _gate = new();
-        private GxrxGaze? _gaze;
+        private GxrxEyeDir? _eyeDir;
         private GxrxPupil? _pupil;
+        private GxrxFace? _face;
         private GxrxTongue? _tongue;
 
         public int Port { get; }
-        public long GazePackets { get; private set; }
+        public long EyeDirPackets { get; private set; }
         public long PupilPackets { get; private set; }
+        public long FacePackets { get; private set; }
         public long TonguePackets { get; private set; }
 
         // Local (PC) receive times. The sender's t_us is CLOCK_MONOTONIC on the
         // headset and is not comparable to PC time, so freshness is measured here.
-        public long GazeLastLocalMs { get; private set; }
+        public long EyeDirLastLocalMs { get; private set; }
         public long PupilLastLocalMs { get; private set; }
+        public long FaceLastLocalMs { get; private set; }
         public long TongueLastLocalMs { get; private set; }
 
         public GxrxReceiver(ILogger logger, int port)
@@ -157,18 +178,25 @@ namespace RootedLinkFT
 
             switch (type)
             {
-                case GxrxType.Gaze:
-                    if (payloadLen < GazePayloadSize) return;
-                    var g = new GxrxGaze { TUs = tUs };
-                    int o = HeaderSize;
-                    for (int i = 0; i < 3; i++) g.LPos[i] = BitConverter.ToSingle(d, o + i * 4);
-                    for (int i = 0; i < 3; i++) g.LDir[i] = BitConverter.ToSingle(d, o + 12 + i * 4);
-                    for (int i = 0; i < 3; i++) g.RPos[i] = BitConverter.ToSingle(d, o + 24 + i * 4);
-                    for (int i = 0; i < 3; i++) g.RDir[i] = BitConverter.ToSingle(d, o + 36 + i * 4);
-                    for (int i = 0; i < 3; i++) g.BinoPt[i] = BitConverter.ToSingle(d, o + 48 + i * 4);
-                    lock (_gate) { _gaze = g; }
-                    GazeLastLocalMs = Environment.TickCount64;
-                    GazePackets++;
+                case GxrxType.EyeDir:
+                    if (payloadLen < EyeDirPayloadSize) return;
+                    var ed = new GxrxEyeDir { TUs = tUs, Mask = d[HeaderSize] };
+                    int eo = HeaderSize + 1;
+                    for (int i = 0; i < 3; i++) ed.LDir[i] = BitConverter.ToSingle(d, eo + i * 4);
+                    for (int i = 0; i < 3; i++) ed.RDir[i] = BitConverter.ToSingle(d, eo + 12 + i * 4);
+                    lock (_gate) { _eyeDir = ed; }
+                    EyeDirLastLocalMs = Environment.TickCount64;
+                    EyeDirPackets++;
+                    break;
+
+                case GxrxType.Face:
+                    if (payloadLen < FacePayloadSize) return;
+                    var fc = new GxrxFace { TUs = tUs };
+                    for (int i = 0; i < GxrxFace.Count; i++)
+                        fc.Values[i] = BitConverter.ToSingle(d, HeaderSize + i * 4);
+                    lock (_gate) { _face = fc; }
+                    FaceLastLocalMs = Environment.TickCount64;
+                    FacePackets++;
                     break;
 
                 case GxrxType.Pupil:
@@ -211,10 +239,16 @@ namespace RootedLinkFT
             }
         }
 
-        /// <summary>Latest gaze frame, or null if none received.</summary>
-        public GxrxGaze? LatestGaze()
+        /// <summary>Latest per-eye direction frame, or null if none received.</summary>
+        public GxrxEyeDir? LatestEyeDir()
         {
-            lock (_gate) return _gaze;
+            lock (_gate) return _eyeDir;
+        }
+
+        /// <summary>Latest 68-blendshape face frame, or null if none received.</summary>
+        public GxrxFace? LatestFace()
+        {
+            lock (_gate) return _face;
         }
 
         /// <summary>Latest pupil frame, or null if none received.</summary>

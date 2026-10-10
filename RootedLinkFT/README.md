@@ -1,19 +1,22 @@
 # RootedLinkFT — VRCFaceTracking module for a rooted Galaxy XR
 
-`RootedLinkFT` is a superset of the dedicated Galaxy XR SteamLink VRCFT module.
-It keeps the whole Steam Link face/eye path intact and adds the parameters that
-only the rooted perception stack can provide.
+`RootedLinkFT` reads the on-headset perception stack directly (over the "GXRX"
+uplink) and adds the parameters that never reach OpenXR, while still accepting
+the Steam Link OSC stream as a fallback.
 
-## What it adds over the dedicated SteamLink module
+## What it provides over OpenXR / the dedicated SteamLink module
 
 | Unified Expression | Source |
 |---|---|
-| `v2/PupilDilation` | 2D pupil ellipse from the eye host plugin, via the GXRX uplink |
-| `v2/PupilDiameterLeft` / `PupilDiameterRight` / `PupilDiameter` | same (mm scale is provisional) |
-| `v2/EyeLeftX/Y`, `v2/EyeRightX/Y` | true per-eye gaze from `eyecap` (fixes the Android XR combined-gaze duplication) |
+| `v2/EyeLeftX/Y`, `v2/EyeRightX/Y` | **true per-eye** gaze directions from the host DNN tensor (fixes the Android XR combined-gaze duplication) |
+| `v2/PupilDilation`, `v2/PupilDiameterLeft/Right/Diameter` | 2D pupil ellipse from the eye host plugin |
+| `TongueRoll`, `TongueArchY`, `TongueShape`, `TongueTwistLeft/Right` | 11-D `predicted_local_tongue_expression` |
+| the 68 face blendshapes | the face host plugin (same set OpenXR exposes) — so face works **without Steam Link** |
 
-Face, lids and the five Galaxy XR tongue directions continue to arrive from
-Steam Link OSC on port 9015 and are unchanged.
+Face, lids and the five Galaxy XR tongue directions still arrive from Steam Link
+OSC on port 9015 and are used as a **fallback** when no fresh GXRX frame has
+arrived, so the module works with Steam Link, Virtual Desktop, ALXR, WiVRn, or no
+streamer at all.
 
 > **Only one VRCFT module can be active at a time.** That is why face/tongue are
 > folded in here instead of running alongside the dedicated module.
@@ -21,15 +24,16 @@ Steam Link OSC on port 9015 and are unchanged.
 ## Data flow
 
 ```
-Steam Link (headset) --OSC 9015--> [OSCHandler] -----------+
-                                                            |
-gxr-relayd (root)  --GXRX UDP 9026--> [GxrxReceiver] ------+--> UnifiedTracking
-eyecap (shell)     --GXRX UDP 9026-->                       |
+gxr_relayd (root, read-only uprobes)  --GXRX UDP 9026--> [GxrxReceiver] --+
+                                                                          |
+Steam Link (headset) --OSC 9015--> [OSCHandler] (fallback) --------------+--> UnifiedTracking
 ```
 
 The module is the receiver: VRCFT loads `RootedLinkFT.dll` in-process and the
 module opens its own UDP socket (port 9026, all interfaces). There is no separate
-PC receiver application.
+PC receiver application. The per-eye gaze comes from a uprobe on the host DNN
+tensor, so there is no vendor-client process and no mount-namespace dance — the
+headset side is a single root process.
 
 ## Build
 
@@ -54,66 +58,36 @@ Otherwise build the ZIP by packaging that DLL + `module.json`.
 ## Requirements
 
 * Rooted Galaxy XR (GhostLock is enough; no Magisk needed on the headset side).
-* `gxr-relayd` running as root, `eyecap` running as `shell`, both sending GXRX
-  to this PC on UDP 9026 (Wi-Fi, or `adb reverse tcp:9026 tcp:9026`).
-* Steam Link OSC on port 9015, as with the dedicated module.
+* `gxr_relayd` running as root, sending GXRX to this PC on UDP 9026 (Wi-Fi, or
+  `adb reverse tcp:9026 tcp:9026`).
+* Steam Link OSC on port 9015 is **optional** (fallback only).
 
-## Per-user convergence (IPD) calibration
+## Optional overrides — `rootedlinkft.json`
 
-The eye service does not expose vergence in the per-eye gaze *directions*; it
-shows up in the reported **eye-position separation (IPD)**. The module turns
-that into per-eye inward rotation, normalized so it works across different
-wearers/headset fits:
-
-```
-neutral = running max IPD, seeded from the first plausible frame   (per wearer)
-rel     = (neutral - ipd) / neutral                # fractional IPD loss
-verg    = clamp(rel / fullScaleFrac, 0, 1) * maxVergenceRad
-EyeLeftX = commonX + verg ;  EyeRightX = commonX - verg
-```
-
-Because the response is a *fraction* of the wearer's own baseline, a 58 mm and a
-72 mm user get the same rotation for the same relative convergence. The baseline
-never decays, so it can't sink to the working distance.
-
-### Optional overrides — `rootedlinkft.json`
-
-Place a JSON file **next to this DLL** (in the installed module folder) to force
-values, e.g. for an unusual fit or a hand calibration:
+Place a JSON file **next to this DLL** (in the installed module folder) to tune:
 
 ```json
-{
-  "neutralIpdMm": 64.5,
-  "fullScaleFrac": 0.24,
-  "maxVergenceRad": 0.33,
-  "deadzoneMm": 0.5
-}
+{ "pupilMmScale": 24, "pupilDilationGain": 0.75 }
 ```
 
 | key | meaning |
 |---|---|
-| `neutralIpdMm` | force the baseline (0 / omit = auto) |
-| `fullScaleFrac` | fractional IPD loss treated as a full cross (default 0.24) |
-| `maxVergenceRad` | per-eye rotation at full cross (default 0.33 rad) |
-| `deadzoneMm` | ignore losses below this (default 0.5 mm) |
-
-To calibrate by hand: have the wearer look far, read `neutral=…mm` from the
-1 Hz log line, then have them cross hard and read the working `verg`. Set
-`neutralIpdMm` to the far value and tune `fullScaleFrac`/`maxVergenceRad` if the
-cross is too strong/weak.
+| `pupilMmScale` | ellipse radius → mm for `PupilDiameter*` (default 24) |
+| `pupilDilationGain` | scales the normalized `PupilDilation` amplitude; 0.75 = 25% smaller (default 0.75) |
 
 ## Known limitations / TODO
 
 * **Pupil detection -> eye mapping is unknown.** All four detections react to
   gaze, so both eyes currently average all four (`LeftPupilIndices` /
   `RightPupilIndices`). `PupilDilation` is therefore correct today; the per-eye
-  `PupilDiameterLeft/Right` split needs the calibration pass in
-  `LIVE-PC-LINK-PLAN.md`.
-* **mm scale is provisional** (`PupilMmScale = 32`). Relative dilation is
-  unaffected (VRCFT normalizes it).
-* If no GXRX gaze/pupil arrives within 500 ms the module falls back to the
-  Steam Link values (gaze) or leaves the last pupil value.
+  `PupilDiameterLeft/Right` split needs a calibration pass.
+* **mm scale is provisional.** Relative dilation is unaffected (VRCFT normalizes
+  it).
+* Face/tongue falls back to the Steam Link OSC values when no fresh GXRX frame
+  arrives within 500 ms; gaze falls back per-eye to the combined OSC gaze.
 
 ## Protocol
 
-See `GxrxProtocol.cs` for the GXRX v1 wire format (header + gaze/pupil payloads).
+See `GxrxProtocol.cs` for the GXRX v1 wire format:
+type 2 pupil, type 3 face (68 blendshapes), type 4 tongue (11-D),
+type 5 per-eye gaze directions.
