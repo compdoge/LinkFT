@@ -12,6 +12,7 @@ the Steam Link OSC stream as a fallback.
 | `v2/PupilDilation`, `v2/PupilDiameterLeft/Right/Diameter` | 2D pupil ellipse from the eye host plugin |
 | `TongueRoll`, `TongueArchY`, `TongueShape`, `TongueTwistLeft/Right` | 11-D `predicted_local_tongue_expression` |
 | the 68 face blendshapes | the face host plugin (same set OpenXR exposes) — so face works **without Steam Link** |
+| un-clamped `JawOpen` | pre-clamp jaw (`0xf09aa4`); the vendor clamps JawOpen up while the tongue is out, this restores closing the jaw with the tongue out |
 
 Face, lids and the five Galaxy XR tongue directions still arrive from Steam Link
 OSC on port 9015 and are used as a **fallback** when no fresh GXRX frame has
@@ -90,4 +91,4 @@ Place a JSON file **next to this DLL** (in the installed module folder) to tune:
 
 See `GxrxProtocol.cs` for the GXRX v1 wire format:
 type 2 pupil, type 3 face (68 blendshapes), type 4 tongue (11-D),
-type 5 per-eye gaze directions.
+type 5 per-eye gaze directions, type 6 pre-clamp jaw.

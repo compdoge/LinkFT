@@ -40,6 +40,7 @@ namespace RootedLinkFT
         Face = 3,
         Tongue = 4,
         EyeDir = 5,
+        Jaw = 6,
     }
 
     /// <summary>
@@ -86,6 +87,20 @@ namespace RootedLinkFT
     }
 
     /// <summary>
+    /// Pre-clamp jaw (host 0xf09aa4) plus the tongue flags that trigger the
+    /// vendor's JawOpen clamp. jaw_raw tracks the real jaw even with the tongue
+    /// out, where the shipped 68-vector (type 3) is pinned up.
+    /// </summary>
+    public sealed class GxrxJaw
+    {
+        public long TUs;
+        public float JawRaw;
+        public float TongueOut;
+        public float TongueUp;
+        public float TongueDown;
+    }
+
+    /// <summary>
     /// Background UDP listener for GXRX v1 packets. Keeps the latest gaze and
     /// pupil frames; the module polls them on its own update tick.
     /// </summary>
@@ -98,6 +113,7 @@ namespace RootedLinkFT
         private const int EyeDirPayloadSize = 1 + 6 * 4;
         private const int FacePayloadSize = GxrxFace.Count * 4;
         private const int TonguePayloadSize = GxrxTongue.Count * 4;
+        private const int JawPayloadSize = 4 * 4;
         private const int MaxDatagram = 4096;
 
         private readonly ILogger _logger;
@@ -110,12 +126,14 @@ namespace RootedLinkFT
         private GxrxPupil? _pupil;
         private GxrxFace? _face;
         private GxrxTongue? _tongue;
+        private GxrxJaw? _jaw;
 
         public int Port { get; }
         public long EyeDirPackets { get; private set; }
         public long PupilPackets { get; private set; }
         public long FacePackets { get; private set; }
         public long TonguePackets { get; private set; }
+        public long JawPackets { get; private set; }
 
         // Local (PC) receive times. The sender's t_us is CLOCK_MONOTONIC on the
         // headset and is not comparable to PC time, so freshness is measured here.
@@ -123,6 +141,7 @@ namespace RootedLinkFT
         public long PupilLastLocalMs { get; private set; }
         public long FaceLastLocalMs { get; private set; }
         public long TongueLastLocalMs { get; private set; }
+        public long JawLastLocalMs { get; private set; }
 
         public GxrxReceiver(ILogger logger, int port)
         {
@@ -199,6 +218,18 @@ namespace RootedLinkFT
                     FacePackets++;
                     break;
 
+                case GxrxType.Jaw:
+                    if (payloadLen < JawPayloadSize) return;
+                    var jw = new GxrxJaw { TUs = tUs };
+                    jw.JawRaw = BitConverter.ToSingle(d, HeaderSize);
+                    jw.TongueOut = BitConverter.ToSingle(d, HeaderSize + 4);
+                    jw.TongueUp = BitConverter.ToSingle(d, HeaderSize + 8);
+                    jw.TongueDown = BitConverter.ToSingle(d, HeaderSize + 12);
+                    lock (_gate) { _jaw = jw; }
+                    JawLastLocalMs = Environment.TickCount64;
+                    JawPackets++;
+                    break;
+
                 case GxrxType.Pupil:
                     if (payloadLen < 1) return;
                     int nd = d[HeaderSize];
@@ -249,6 +280,12 @@ namespace RootedLinkFT
         public GxrxFace? LatestFace()
         {
             lock (_gate) return _face;
+        }
+
+        /// <summary>Latest pre-clamp jaw frame, or null if none received.</summary>
+        public GxrxJaw? LatestJaw()
+        {
+            lock (_gate) return _jaw;
         }
 
         /// <summary>Latest pupil frame, or null if none received.</summary>

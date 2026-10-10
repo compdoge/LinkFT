@@ -57,7 +57,9 @@ namespace RootedLinkFT
         // type 5). No synthesis: each eye's x/y is atan2 of its own direction
         // vector, so convergence is real and needs no per-user calibration.
         private const bool GazeDebug = true;         // 1 Hz gaze-source log
+        private const bool JawDebug = true;          // 2 Hz jaw override log
         private long _lastGazeLogMs;
+        private long _lastJawLogMs;
 
         // Which pupil detections belong to which eye. UNKNOWN today (the four
         // detections all react to gaze), so both eyes average all detections and
@@ -80,6 +82,15 @@ namespace RootedLinkFT
         private bool _hadTongue;
         private readonly float[] _faceClosed = new float[2];
         private bool _faceEyelidsValid;
+
+        // Un-clamped jaw (type 6). The shipped 68-vector pins JawOpen up while
+        // the tongue is out; we read the pre-clamp jaw and its rest baseline.
+        private bool _hadJaw;
+        private readonly float[] _jawHist = new float[1024];
+        private int _jawHistN;
+        private int _jawHistIdx;
+        private float _jawNeutral = 0.2f;
+        private long _jawNeutralMs;
 
         public override (bool SupportsEye, bool SupportsExpression) Supported => (true, true);
 
@@ -343,6 +354,67 @@ namespace RootedLinkFT
             (66, (int)TongueUp), (67, (int)TongueDown),
         };
 
+        /// <summary>
+        /// Override JawOpen from the pre-clamp jaw while the vendor's tongue
+        /// clamp is active, so the jaw can still close with the tongue out.
+        /// Runs after UpdateFaceTracking so it overrides the type-3 JawOpen.
+        /// </summary>
+        private void UpdateJaw()
+        {
+            var jw = Gxrx?.LatestJaw();
+            bool fresh = jw != null && (Environment.TickCount64 - Gxrx!.JawLastLocalMs) <= FRESH_MS;
+            if (!fresh) return;
+
+            if (!_hadJaw)
+            {
+                _hadJaw = true;
+                Logger.LogInformation("[RootedLinkFT] un-clamped jaw streaming (GXRX)");
+            }
+
+            // Only substitute while the clamp is actually driving the jaw.
+            bool clampActive = jw.TongueOut > 0.15f || jw.TongueUp > 0.15f || jw.TongueDown > 0.15f;
+
+            // Learn the rest baseline only while the clamp is NOT active: with
+            // the tongue in, the raw jaw reflects the true rest and can't drag
+            // the baseline up while the tongue is out.
+            long now = Environment.TickCount64;
+            if (!clampActive)
+            {
+                _jawHist[_jawHistIdx] = jw.JawRaw;
+                _jawHistIdx = (_jawHistIdx + 1) % _jawHist.Length;
+                if (_jawHistN < _jawHist.Length) _jawHistN++;
+            }
+            if (_jawHistN >= 60 && now - _jawNeutralMs > 500)
+            {
+                _jawNeutralMs = now;
+                var sorted = new float[_jawHistN];
+                Array.Copy(_jawHist, sorted, _jawHistN);
+                Array.Sort(sorted);
+                _jawNeutral = sorted[(int)(0.05f * (_jawHistN - 1))];
+                if (_jawNeutral > 0.40f) _jawNeutral = 0.40f;
+                if (_jawNeutral < 0.05f) _jawNeutral = 0.05f;
+            }
+
+            float shipped = UnifiedTracking.Data.Shapes[(int)JawOpen].Weight;
+            bool inBand = shipped > 0.40f && shipped < 0.56f;
+
+            float jawCal = shipped;
+            if (clampActive || inBand)
+            {
+                float denom = MathF.Max(1f - _jawNeutral, 0.2f);
+                jawCal = Clamp01((jw.JawRaw - _jawNeutral) / denom);
+                UnifiedTracking.Data.Shapes[(int)JawOpen].Weight = jawCal;
+            }
+
+            if (JawDebug && now - _lastJawLogMs > 500)
+            {
+                _lastJawLogMs = now;
+                Logger.LogInformation(
+                    "[RootedLinkFT] jaw raw={Raw:F3} neutral={N:F3} shipped={S:F3} clamp={C} -> JawOpen={J:F3}",
+                    jw.JawRaw, _jawNeutral, shipped, clampActive ? "yes" : "no", jawCal);
+            }
+        }
+
         private static float Clamp01(float v) => v < 0f ? 0f : (v > 1f ? 1f : v);
 
         /// <summary>Optional per-user/per-fit overrides from rootedlinkft.json.</summary>
@@ -413,6 +485,7 @@ namespace RootedLinkFT
             Thread.Sleep(10);
             UpdateEyeTracking();
             UpdateFaceTracking();
+            UpdateJaw();    // after face: override the tongue-clamped JawOpen
             UpdateTongue(); // after face: the GXRX tongue overrides the Steam Link DOFs
         }
 
