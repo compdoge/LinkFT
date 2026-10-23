@@ -22,6 +22,22 @@ namespace SteamLinkVRCFTModule
         public readonly float[] eyeTrackData = new float[3];
         public readonly float[] eyelids = new float[2];
 
+        // Face-tracker eye look weights; GazeFilter uses them while Steam Link's gaze is bad.
+        public readonly float[] eyeLook = new float[8];
+        public const int EyeLookLeftL = 0, EyeLookLeftR = 1, EyeLookRightL = 2, EyeLookRightR = 3,
+                         EyeLookUpL = 4, EyeLookUpR = 5, EyeLookDownL = 6, EyeLookDownR = 7;
+        private static readonly Dictionary<string, int> mapOSCEyeLook = new()
+        {
+            {"/sl/xrfb/facew/EyesLookLeftL", EyeLookLeftL},
+            {"/sl/xrfb/facew/EyesLookLeftR", EyeLookLeftR},
+            {"/sl/xrfb/facew/EyesLookRightL", EyeLookRightL},
+            {"/sl/xrfb/facew/EyesLookRightR", EyeLookRightR},
+            {"/sl/xrfb/facew/EyesLookUpL", EyeLookUpL},
+            {"/sl/xrfb/facew/EyesLookUpR", EyeLookUpR},
+            {"/sl/xrfb/facew/EyesLookDownL", EyeLookDownL},
+            {"/sl/xrfb/facew/EyesLookDownR", EyeLookDownR},
+        };
+
         public static readonly Dictionary<UnifiedExpressions, float> ueData = new(){
             {EyeWideLeft, 0.0f },
             {EyeWideRight, 0.0f },
@@ -270,6 +286,11 @@ namespace SteamLinkVRCFTModule
                             if (oscMessage.Address == "/sl/xrfb/facew/EyesClosedR")
                             {
                                 eyelids[1] = (float)oscMessage.Values[0];
+                                continue;
+                            }
+                            if (mapOSCEyeLook.TryGetValue(oscMessage.Address, out int eyeLookIndex))
+                            {
+                                eyeLook[eyeLookIndex] = (float)oscMessage.Values[0];
                                 continue;
                             }
 

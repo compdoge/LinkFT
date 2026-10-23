@@ -27,6 +27,17 @@ does:
   (`EyeLeftX1/X2/X4`...) do not clamp, so values past 1.0 wrapped and flicked
   the eyes between the edge and the centre.
 
+Steam Link also sends ~100 ms runs of wrong gaze whenever the gaze points near
+yaw 180° of the headset's tracking space. The vector is turned about 180°
+around world up, so it points behind the head and is rejected. This was found
+by recording the OSC stream together with SteamVR's head pose. Holding the
+last gaze through these runs froze the eyes and then snapped them.
+`GazeFilter.cs` instead moves the gaze during a run by how much the face
+tracker's `EyesLook*` weights changed, since those arrive through a separate
+path. When good data returns it fades the difference out over 60 ms. On four
+recorded sessions this removed every freeze and cut the error at the end of a
+run from 12° to 8° on average. A clean session's output is unchanged.
+
 Head roll does not leak into gaze on this path: Steam Link's PC driver forwards
 the headset's gaze vector unchanged, so the quaternion problem fixed in the
 Virtual Desktop module does not apply here.
