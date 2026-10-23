@@ -10,6 +10,42 @@ the five transported Galaxy XR tongue values to the VRCFT unified
 expressions `TongueOut`, `TongueLeft`, `TongueRight`, `TongueUp`, and
 `TongueDown`.
 
+## Gaze fix
+
+Eyes could twitch when looking toward the edge. `GazeFix.cs` converts the
+Steam Link gaze vector (`/sl/eyeTrackedGazePoint`) the way the
+[Galaxy XR Virtual Desktop fix](https://github.com/SinonVT/GalaxyXR-EyeTracking-Fix-Virtual-Desktop)
+does:
+
+- Pitch is the elevation `atan2(y, sqrt(x² + z²))` instead of `atan2(y, -z)`.
+  The old pitch grew as `1/cos(yaw)`, so near the left/right edge vertical
+  noise was amplified (5° up read as 10° at 60° yaw). Yaw is unchanged.
+- Zero, NaN, exactly centred (identity pose) and backwards vectors are
+  rejected and the last good gaze is held. A zero vector used to produce
+  `atan2(0, -0) = π` on both axes, for example before the first packet.
+- Output is clamped to ±1.0. VRCFT's binary eye parameters
+  (`EyeLeftX1/X2/X4`...) do not clamp, so values past 1.0 wrapped and flicked
+  the eyes between the edge and the centre.
+
+Steam Link also sends ~100 ms runs of wrong gaze whenever the gaze points near
+yaw 180° of the headset's tracking space. The vector is turned about 180°
+around world up, so it points behind the head and is rejected. This was found
+by recording the OSC stream together with SteamVR's head pose. Holding the
+last gaze through these runs froze the eyes and then snapped them.
+`GazeFilter.cs` instead moves the gaze during a run by how much the face
+tracker's `EyesLook*` weights changed, since those arrive through a separate
+path. When good data returns it fades the difference out over 60 ms. On four
+recorded sessions this removed every freeze and cut the error at the end of a
+run from 12° to 8° on average. A clean session's output is unchanged.
+
+Head roll does not leak into gaze on this path: Steam Link's PC driver forwards
+the headset's gaze vector unchanged, so the quaternion problem fixed in the
+Virtual Desktop module does not apply here.
+
+Once a second, if anything was rejected, clamped or jumped by more than
+0.5 rad, the module logs a `[GazeFix]` warning with the counts and the raw
+vector. Check VRCFT's Output page after reproducing a glitch.
+
 ## Install
 
 - Build or use the dedicated module ZIP packaged beside this source tree.
