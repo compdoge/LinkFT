@@ -3,6 +3,7 @@ using SteamLinkVRCFTModule;
 using System.Net.Sockets;
 using VRCFaceTracking;
 using VRCFaceTracking.Core.Params.Expressions;
+using VRCFaceTracking.Core.Types;
 using static VRCFaceTracking.Core.Params.Expressions.UnifiedExpressions;
 
 namespace SteamLinkVRCFTModule
@@ -32,29 +33,54 @@ namespace SteamLinkVRCFTModule
             return 1.0f - Math.Clamp(fEyeClosedWeight + fEyeClosedWeight * fEyeTightener, 0.0f, 1.0f);
         }
 
+        // Last gaze that passed GazeFix; held while Steam Link sends unusable vectors.
+        private Vector2 _lastGaze = Vector2.zero;
+        private float _lastRawX, _lastRawY, _lastRawZ;
+
+        // Once-per-second summary of rejected vectors and large jumps, so a glitch
+        // seen on the avatar can be matched against the raw Steam Link data.
+        private const float GAZE_JUMP_RAD = 0.5f;
+        private readonly int[] _gazeRejectCounts = new int[Enum.GetValues<GazeReject>().Length];
+        private int _gazeJumpCount, _gazeClampCount;
+        private string _gazeLastAnomaly = "";
+        private long _gazeLogMs;
+
         private void UpdateEyeTracking()
         {
             {
-                float fAngleX = MathF.Atan2(OSCHandler.eyeTrackData[0], -OSCHandler.eyeTrackData[2]);
-                float fAngleY = MathF.Atan2(OSCHandler.eyeTrackData[1], -OSCHandler.eyeTrackData[2]);
+                float fRawX = OSCHandler.eyeTrackData[0];
+                float fRawY = OSCHandler.eyeTrackData[1];
+                float fRawZ = OSCHandler.eyeTrackData[2];
+                bool bNewSample = fRawX != _lastRawX || fRawY != _lastRawY || fRawZ != _lastRawZ;
+                (_lastRawX, _lastRawY, _lastRawZ) = (fRawX, fRawY, fRawZ);
 
-                float fNmAngleX = fAngleX / (MathF.PI / 2.0f) * 2.0f;
-                float fNmAngleY = fAngleY / (MathF.PI / 2.0f) * 2.0f;
-
-                if (float.IsNaN(fNmAngleX))
+                GazeReject reject = GazeFix.TryFromDirection(fRawX, fRawY, fRawZ, out Vector2 gaze);
+                if (reject == GazeReject.None)
                 {
-                    fNmAngleX = 0.0f;
+                    if (bNewSample)
+                    {
+                        if (MathF.Abs(gaze.x) >= GazeFix.MaxGaze || MathF.Abs(gaze.y) >= GazeFix.MaxGaze)
+                        {
+                            _gazeClampCount++;
+                            _gazeLastAnomaly = $"clamped raw=({fRawX:F3},{fRawY:F3},{fRawZ:F3})";
+                        }
+                        if (MathF.Abs(gaze.x - _lastGaze.x) > GAZE_JUMP_RAD || MathF.Abs(gaze.y - _lastGaze.y) > GAZE_JUMP_RAD)
+                        {
+                            _gazeJumpCount++;
+                            _gazeLastAnomaly = $"jump ({_lastGaze.x:F2},{_lastGaze.y:F2})->({gaze.x:F2},{gaze.y:F2}) raw=({fRawX:F3},{fRawY:F3},{fRawZ:F3})";
+                        }
+                    }
+                    _lastGaze = gaze;
                 }
-                if (float.IsNaN(fNmAngleY))
+                else if (bNewSample)
                 {
-                    fNmAngleY = 0.0f;
+                    _gazeRejectCounts[(int)reject]++;
+                    _gazeLastAnomaly = $"{reject} raw=({fRawX:F3},{fRawY:F3},{fRawZ:F3})";
                 }
+                LogGazeAnomalies();
 
-                UnifiedTracking.Data.Eye.Left.Gaze.x = fAngleX;
-                UnifiedTracking.Data.Eye.Left.Gaze.y = fAngleY;
-
-                UnifiedTracking.Data.Eye.Right.Gaze.x = fAngleX;
-                UnifiedTracking.Data.Eye.Right.Gaze.y = fAngleY;
+                UnifiedTracking.Data.Eye.Left.Gaze = _lastGaze;
+                UnifiedTracking.Data.Eye.Right.Gaze = _lastGaze;
 
 
                 //Pupil Dilation, This is not supported, but if we don't set it can cause issues
@@ -74,6 +100,33 @@ namespace SteamLinkVRCFTModule
             }
 
         }
+
+        private void LogGazeAnomalies()
+        {
+            long now = Environment.TickCount64;
+            if (now - _gazeLogMs < 1000)
+            {
+                return;
+            }
+            _gazeLogMs = now;
+
+            int rejected = _gazeRejectCounts.Sum();
+            if (rejected == 0 && _gazeJumpCount == 0 && _gazeClampCount == 0)
+            {
+                return;
+            }
+
+            Logger.LogWarning("[GazeFix] last 1s: rejected={Rejected} (nonfinite={NonFinite} zero={Zero} center={Center} notforward={NotForward}) jumps={Jumps} clamped={Clamped}; last: {Last}",
+                rejected,
+                _gazeRejectCounts[(int)GazeReject.NonFinite], _gazeRejectCounts[(int)GazeReject.Zero],
+                _gazeRejectCounts[(int)GazeReject.ExactCenter], _gazeRejectCounts[(int)GazeReject.NotForward],
+                _gazeJumpCount, _gazeClampCount, _gazeLastAnomaly);
+
+            Array.Clear(_gazeRejectCounts);
+            _gazeJumpCount = 0;
+            _gazeClampCount = 0;
+        }
+
         private void UpdateFaceTracking()
         {
             foreach (KeyValuePair<UnifiedExpressions, float> entry in OSCHandler.ueData)
